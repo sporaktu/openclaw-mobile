@@ -33,7 +33,16 @@ struct OpenClawMobileApp: App {
                         } else if let first = gateway.sessions.first {
                             await gateway.switchSession(to: first.sessionKey)
                         }
+
+                        // Push initial data to widgets
+                        WidgetDataWriter.update(gateway: gateway, kanbanService: kanbanService)
                     }
+                }
+                .onChange(of: gateway.messages.count) {
+                    WidgetDataWriter.update(gateway: gateway, kanbanService: kanbanService)
+                }
+                .onChange(of: gateway.isConnected) {
+                    WidgetDataWriter.update(gateway: gateway, kanbanService: kanbanService)
                 }
         }
     }
