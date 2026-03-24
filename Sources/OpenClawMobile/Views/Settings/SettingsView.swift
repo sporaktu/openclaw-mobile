@@ -1,39 +1,39 @@
 import SwiftUI
 
 struct SettingsView: View {
-    @EnvironmentObject var config: AppConfiguration
+    @Environment(AppConfiguration.self) private var config
+    @Environment(GatewayService.self) private var gateway
+    @Environment(KnowledgeGraphService.self) private var kgService
     @State private var isTesting = false
     @State private var testResult: String?
     @State private var gatewayStatus: GatewayStatus?
     @State private var kgStats: KGStats?
 
+    // Local editing copies (Keychain token can't be bound directly)
+    @State private var editingToken = ""
+    @State private var tokenLoaded = false
+
     var body: some View {
+        @Bindable var config = config
+
         NavigationStack {
             ZStack {
                 AppTheme.background.ignoresSafeArea()
 
                 ScrollView {
                     VStack(spacing: 16) {
-                        // Gateway Section
                         gatewaySection
-
-                        // Knowledge Graph Section
                         knowledgeGraphSection
-
-                        // Connection Test
                         testSection
 
-                        // Agent Info
-                        if config.gatewayConnected {
+                        if gateway.isConnected {
                             agentInfoSection
                         }
 
-                        // KG Stats
                         if let stats = kgStats {
                             kgStatsSection(stats)
                         }
 
-                        // App Info
                         appInfoSection
                     }
                     .padding()
@@ -45,16 +45,24 @@ struct SettingsView: View {
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .navigationBar)
         }
+        .onAppear {
+            if !tokenLoaded {
+                editingToken = config.gatewayToken
+                tokenLoaded = true
+            }
+        }
     }
 
     // MARK: - Gateway Section
 
     private var gatewaySection: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        @Bindable var config = config
+
+        return VStack(alignment: .leading, spacing: 12) {
             HStack {
                 sectionHeader("OpenClaw Gateway")
                 Spacer()
-                ConnectionIndicator(isConnected: config.gatewayConnected)
+                ConnectionIndicator(isConnected: gateway.isConnected)
             }
 
             VStack(spacing: 10) {
@@ -77,25 +85,14 @@ struct SettingsView: View {
                     Image(systemName: "key")
                         .foregroundStyle(AppTheme.textTertiary)
                         .frame(width: 20)
-                    SecureField("Gateway Token", text: $config.gatewayToken)
+                    SecureField("Gateway Token", text: $editingToken)
                         .font(AppTheme.bodyFont)
                         .foregroundStyle(AppTheme.textPrimary)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                }
-
-                Divider()
-                    .background(AppTheme.textTertiary.opacity(0.3))
-
-                HStack {
-                    Image(systemName: "person.circle")
-                        .foregroundStyle(AppTheme.textTertiary)
-                        .frame(width: 20)
-                    TextField("Session Key", text: $config.sessionKey)
-                        .font(AppTheme.bodyFont)
-                        .foregroundStyle(AppTheme.textPrimary)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
+                        .onChange(of: editingToken) { _, newValue in
+                            config.gatewayToken = newValue
+                        }
                 }
             }
         }
@@ -105,11 +102,13 @@ struct SettingsView: View {
     // MARK: - Knowledge Graph Section
 
     private var knowledgeGraphSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        @Bindable var config = config
+
+        return VStack(alignment: .leading, spacing: 12) {
             HStack {
                 sectionHeader("Knowledge Graph API")
                 Spacer()
-                ConnectionIndicator(isConnected: config.kgConnected)
+                ConnectionIndicator(isConnected: kgStats != nil)
             }
 
             VStack(spacing: 10) {
@@ -185,8 +184,8 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("Agent Info")
 
-            if !config.agentName.isEmpty {
-                infoRow(label: "Agent Name", value: config.agentName)
+            if !gateway.agentName.isEmpty {
+                infoRow(label: "Model", value: gateway.agentName)
             }
 
             if let status = gatewayStatus {
@@ -197,6 +196,8 @@ struct SettingsView: View {
                     infoRow(label: "Uptime", value: uptime)
                 }
             }
+
+            infoRow(label: "Sessions", value: "\(gateway.sessions.count)")
         }
         .cardStyle()
     }
@@ -293,31 +294,30 @@ struct SettingsView: View {
         // Test Gateway
         if config.isConfigured {
             do {
-                let url = URL(string: config.gatewayURL.trimmingCharacters(in: .init(charactersIn: "/")) + "/api/status")!
+                let url = URL(string: config.normalizedGatewayURL + "/api/status")!
                 var req = URLRequest(url: url)
                 req.setValue("Bearer \(config.gatewayToken)", forHTTPHeaderField: "Authorization")
                 let (data, _) = try await URLSession.shared.data(for: req)
                 let status = try JSONDecoder().decode(GatewayStatus.self, from: data)
                 gatewayStatus = status
-                results.append("✅ Gateway connected")
+                results.append("Gateway connected")
             } catch {
-                results.append("❌ Gateway connection failed: \(error.localizedDescription)")
+                results.append("Gateway failed: \(error.localizedDescription)")
             }
         } else {
-            results.append("⚠️ Gateway not configured")
+            results.append("Gateway not configured")
         }
 
         // Test KG
-        if config.isKGConfigured {
-            let service = KnowledgeGraphService(config: config)
-            if let stats = await service.fetchStats() {
+        if kgService.isConfigured {
+            if let stats = await kgService.fetchStats() {
                 kgStats = stats
-                results.append("✅ Knowledge Graph connected (\(stats.entityCount ?? 0) entities)")
+                results.append("KG connected (\(stats.entityCount ?? 0) entities)")
             } else {
-                results.append("❌ Knowledge Graph connection failed")
+                results.append("KG connection failed")
             }
         } else {
-            results.append("⚠️ Knowledge Graph not configured")
+            results.append("KG not configured")
         }
 
         testResult = results.joined(separator: "\n")
@@ -326,5 +326,7 @@ struct SettingsView: View {
 
 #Preview {
     SettingsView()
-        .environmentObject(AppConfiguration())
+        .environment(AppConfiguration())
+        .environment(GatewayService())
+        .environment(KnowledgeGraphService())
 }

@@ -2,7 +2,7 @@ import SwiftUI
 
 struct EntityDetailView: View {
     let entity: Entity
-    @EnvironmentObject var config: AppConfiguration
+    @Environment(KnowledgeGraphService.self) private var kgService
     @State private var fullEntity: Entity?
     @State private var relationships: [Relationship] = []
     @State private var isLoading = false
@@ -235,15 +235,14 @@ struct EntityDetailView: View {
     }
 
     private func loadDetails() async {
-        guard config.isKGConfigured else { return }
+        guard kgService.isConfigured else { return }
         isLoading = true
         defer { isLoading = false }
 
-        let service = KnowledgeGraphService(config: config)
-        if let detail = await service.fetchEntity(name: entity.name) {
+        if let detail = await kgService.fetchEntity(name: entity.name) {
             fullEntity = detail
         }
-        relationships = await service.fetchRelationships(entity: entity.name)
+        relationships = await kgService.fetchRelationships(entity: entity.name)
     }
 }
 
@@ -271,5 +270,5 @@ struct EntityDetailView: View {
             ]
         ))
     }
-    .environmentObject(AppConfiguration())
+    .environment(KnowledgeGraphService())
 }

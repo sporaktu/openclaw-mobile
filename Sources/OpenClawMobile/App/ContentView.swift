@@ -1,21 +1,22 @@
 import SwiftUI
 
 struct ContentView: View {
-    @EnvironmentObject var config: AppConfiguration
+    @Environment(AppConfiguration.self) private var config
+    @Environment(GatewayService.self) private var gateway
     @State private var selectedTab = 0
 
     var body: some View {
         TabView(selection: $selectedTab) {
             Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: 0) {
-                ChatView()
+                ChatContainerView()
             }
 
-            Tab("Tasks", systemImage: "checklist", value: 1) {
-                TasksView()
+            Tab("Sessions", systemImage: "rectangle.stack", value: 1) {
+                SessionsListView()
             }
 
-            Tab("Graph", systemImage: "circle.grid.cross", value: 2) {
-                GraphView()
+            Tab("Crons", systemImage: "clock.arrow.2.circlepath", value: 2) {
+                CronsListView()
             }
 
             Tab("Settings", systemImage: "gear", value: 3) {
@@ -25,6 +26,9 @@ struct ContentView: View {
         .tint(AppTheme.accent)
         .onAppear {
             configureTabBarAppearance()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .switchToChat)) { _ in
+            selectedTab = 0
         }
     }
 
@@ -50,5 +54,8 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
-        .environmentObject(AppConfiguration())
+        .environment(AppConfiguration())
+        .environment(GatewayService())
+        .environment(CronService())
+        .environment(KnowledgeGraphService())
 }

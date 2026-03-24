@@ -1,48 +1,34 @@
 import SwiftUI
 
 struct ChatView: View {
-    @EnvironmentObject var config: AppConfiguration
-    @StateObject private var gateway: GatewayService
-    @State private var messageText = ""
-    @State private var scrollToBottom = false
-
-    init() {
-        // Placeholder init — actual config injected via .environmentObject
-        _gateway = StateObject(wrappedValue: GatewayService(config: AppConfiguration()))
-    }
+    @Environment(GatewayService.self) private var gateway
+    @Environment(AppConfiguration.self) private var config
 
     var body: some View {
-        NavigationStack {
-            ZStack {
-                AppTheme.background.ignoresSafeArea()
+        ZStack {
+            AppTheme.background.ignoresSafeArea()
 
-                if !config.isConfigured {
-                    unconfiguredView
-                } else {
-                    chatContent
-                }
+            if !config.isConfigured {
+                unconfiguredView
+            } else {
+                chatContent
             }
-            .navigationTitle("Chat")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbarBackground(AppTheme.background, for: .navigationBar)
-            .toolbarBackground(.visible, for: .navigationBar)
-            .toolbarColorScheme(.dark, for: .navigationBar)
         }
-        .onAppear {
-            updateGatewayConfig()
-        }
-        .onChange(of: config.gatewayURL) { _, _ in updateGatewayConfig() }
-        .onChange(of: config.gatewayToken) { _, _ in updateGatewayConfig() }
     }
 
     // MARK: - Chat Content
 
     private var chatContent: some View {
         VStack(spacing: 0) {
+            // Error banner
+            if let error = gateway.error {
+                errorBanner(error)
+            }
+
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 8) {
-                        if gateway.messages.isEmpty && !gateway.isLoading {
+                        if gateway.messages.isEmpty && !gateway.isGenerating {
                             emptyStateView
                         }
 
@@ -51,40 +37,60 @@ struct ChatView: View {
                                 .id(message.id)
                         }
 
-                        if gateway.isLoading {
-                            HStack {
-                                ProgressView()
-                                    .tint(AppTheme.accent)
-                                Text("Thinking...")
-                                    .font(AppTheme.captionFont)
-                                    .foregroundStyle(AppTheme.textSecondary)
-                            }
-                            .padding()
-                            .id("loading")
+                        if gateway.isGenerating {
+                            StreamingIndicator(
+                                stage: gateway.processingStage,
+                                streamingText: gateway.streamingText
+                            )
+                            .id("streaming")
                         }
                     }
                     .padding(.horizontal)
                     .padding(.top, 8)
+                    .padding(.bottom, 4)
                 }
                 .refreshable {
-                    await gateway.fetchHistory()
+                    await gateway.fetchHistory(sessionKey: gateway.currentSessionKey)
                 }
                 .onChange(of: gateway.messages.count) { _, _ in
                     withAnimation {
-                        if let lastId = gateway.messages.last?.id {
+                        if gateway.isGenerating {
+                            proxy.scrollTo("streaming", anchor: .bottom)
+                        } else if let lastId = gateway.messages.last?.id {
                             proxy.scrollTo(lastId, anchor: .bottom)
                         }
                     }
                 }
-            }
-
-            Divider()
-                .background(AppTheme.textTertiary.opacity(0.3))
-
-            ChatInputBar(text: $messageText, isLoading: gateway.isLoading) {
-                await sendMessage()
+                .onChange(of: gateway.streamingText) { _, _ in
+                    if gateway.isGenerating {
+                        proxy.scrollTo("streaming", anchor: .bottom)
+                    }
+                }
             }
         }
+    }
+
+    // MARK: - Error Banner
+
+    private func errorBanner(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 12))
+            Text(message)
+                .font(AppTheme.captionFont)
+                .lineLimit(2)
+            Spacer()
+            Button {
+                gateway.error = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .bold))
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(AppTheme.statusBlocked.opacity(0.85))
     }
 
     // MARK: - Empty State
@@ -125,23 +131,10 @@ struct ChatView: View {
         }
         .padding()
     }
-
-    // MARK: - Actions
-
-    private func sendMessage() async {
-        let text = messageText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        messageText = ""
-        _ = await gateway.sendMessage(text)
-    }
-
-    private func updateGatewayConfig() {
-        // Re-create the service with current config
-        // In production you'd use dependency injection; here we work with @EnvironmentObject
-    }
 }
 
 #Preview {
     ChatView()
-        .environmentObject(AppConfiguration())
+        .environment(GatewayService())
+        .environment(AppConfiguration())
 }

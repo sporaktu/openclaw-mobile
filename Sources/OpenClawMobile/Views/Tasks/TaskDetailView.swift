@@ -2,8 +2,6 @@ import SwiftUI
 
 struct TaskDetailView: View {
     let task: AgentTask
-    @EnvironmentObject var config: AppConfiguration
-
     var body: some View {
         ZStack {
             AppTheme.background.ignoresSafeArea()
@@ -247,5 +245,4 @@ struct FlowLayout: Layout {
             completedAt: nil
         ))
     }
-    .environmentObject(AppConfiguration())
 }

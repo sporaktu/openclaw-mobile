@@ -1,7 +1,8 @@
 import SwiftUI
 
 struct GraphView: View {
-    @EnvironmentObject var config: AppConfiguration
+    @Environment(AppConfiguration.self) private var config
+    @Environment(KnowledgeGraphService.self) private var kgService
     @State private var entities: [Entity] = []
     @State private var searchText = ""
     @State private var selectedFilter: EntityTypeFilter = .all
@@ -41,7 +42,7 @@ struct GraphView: View {
                     .padding(.horizontal)
                     .padding(.vertical, 8)
 
-                    if !config.isKGConfigured {
+                    if !kgService.isConfigured {
                         unconfiguredView
                     } else if isLoading && entities.isEmpty {
                         Spacer()
@@ -140,18 +141,18 @@ struct GraphView: View {
     // MARK: - Data Loading
 
     private func loadEntities() async {
-        guard config.isKGConfigured else { return }
+        guard kgService.isConfigured else { return }
         isLoading = true
         defer { isLoading = false }
 
-        let service = KnowledgeGraphService(config: config)
-        await service.fetchEntities(type: selectedFilter.apiValue)
-        entities = service.entities
-        error = service.error
+        await kgService.fetchEntities(type: selectedFilter.apiValue)
+        entities = kgService.entities
+        error = kgService.error
     }
 }
 
 #Preview {
     GraphView()
-        .environmentObject(AppConfiguration())
+        .environment(AppConfiguration())
+        .environment(KnowledgeGraphService())
 }

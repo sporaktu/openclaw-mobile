@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct TasksView: View {
-    @EnvironmentObject var config: AppConfiguration
+    @Environment(KnowledgeGraphService.self) private var kgService
     @State private var tasks: [AgentTask] = []
     @State private var selectedFilter: TaskFilter = .all
     @State private var isLoading = false
@@ -36,7 +36,7 @@ struct TasksView: View {
                     .padding(.horizontal)
                     .padding(.vertical, 8)
 
-                    if !config.isKGConfigured {
+                    if !kgService.isConfigured {
                         unconfiguredView
                     } else if isLoading && tasks.isEmpty {
                         Spacer()
@@ -137,18 +137,17 @@ struct TasksView: View {
     // MARK: - Data Loading
 
     private func loadTasks() async {
-        guard config.isKGConfigured else { return }
+        guard kgService.isConfigured else { return }
         isLoading = true
         defer { isLoading = false }
 
-        let service = KnowledgeGraphService(config: config)
-        await service.fetchTasks(status: selectedFilter.apiValue)
-        tasks = service.tasks
-        error = service.error
+        await kgService.fetchTasks(status: selectedFilter.apiValue)
+        tasks = kgService.tasks
+        error = kgService.error
     }
 }
 
 #Preview {
     TasksView()
-        .environmentObject(AppConfiguration())
+        .environment(KnowledgeGraphService())
 }

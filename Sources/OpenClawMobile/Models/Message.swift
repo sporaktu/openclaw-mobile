@@ -4,7 +4,7 @@ import Foundation
 
 struct ChatMessage: Codable, Identifiable, Sendable {
     let id: String
-    let role: String
+    let role: String                // "user", "assistant", "tool", "system"
     let content: String
     let timestamp: String?
     let sessionKey: String?
@@ -14,29 +14,25 @@ struct ChatMessage: Codable, Identifiable, Sendable {
         case sessionKey = "session_key"
     }
 
-    var isUser: Bool {
-        role.lowercased() == "user"
-    }
-
-    var isAssistant: Bool {
-        role.lowercased() == "assistant"
-    }
+    var isUser: Bool { role.lowercased() == "user" }
+    var isAssistant: Bool { role.lowercased() == "assistant" }
+    var isSystem: Bool { role.lowercased() == "system" }
 
     var formattedTime: String {
-        guard let timestamp = timestamp else { return "" }
+        guard let timestamp else { return "" }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         if let date = formatter.date(from: timestamp) {
-            let displayFormatter = DateFormatter()
-            displayFormatter.timeStyle = .short
-            return displayFormatter.string(from: date)
+            return Self.timeFormatter.string(from: date)
         }
-        // Try without fractional seconds
         formatter.formatOptions = [.withInternetDateTime]
         if let date = formatter.date(from: timestamp) {
-            let displayFormatter = DateFormatter()
-            displayFormatter.timeStyle = .short
-            return displayFormatter.string(from: date)
+            return Self.timeFormatter.string(from: date)
+        }
+        // Try Unix timestamp (ms)
+        if let ms = Double(timestamp) {
+            let date = Date(timeIntervalSince1970: ms / 1000)
+            return Self.timeFormatter.string(from: date)
         }
         return ""
     }
@@ -50,24 +46,57 @@ struct ChatMessage: Codable, Identifiable, Sendable {
             sessionKey: sessionKey
         )
     }
-}
 
-// MARK: - Session
+    /// Parse from a raw dictionary (used for gateway event payloads)
+    static func from(dict: [String: Any]) -> ChatMessage? {
+        let role = dict["role"] as? String ?? "assistant"
 
-struct ChatSession: Codable, Identifiable, Sendable {
-    let id: String
-    let key: String
-    let channel: String?
-    let agentName: String?
-    let createdAt: String?
-    let lastActivity: String?
+        // Content can be a string or array of content blocks
+        let content: String
+        if let text = dict["content"] as? String {
+            content = text
+        } else if let blocks = dict["content"] as? [[String: Any]] {
+            // Extract text from content blocks
+            content = blocks.compactMap { block -> String? in
+                if block["type"] as? String == "text" {
+                    return block["text"] as? String
+                }
+                if block["type"] as? String == "thinking" {
+                    return nil // skip thinking blocks
+                }
+                if block["type"] as? String == "tool_use" {
+                    let name = block["name"] as? String ?? "tool"
+                    return "[\(name)]"
+                }
+                return nil
+            }.joined(separator: "\n")
+        } else {
+            return nil
+        }
 
-    enum CodingKeys: String, CodingKey {
-        case id, key, channel
-        case agentName = "agent_name"
-        case createdAt = "created_at"
-        case lastActivity = "last_activity"
+        let timestamp: String?
+        if let ts = dict["timestamp"] as? String {
+            timestamp = ts
+        } else if let ts = dict["timestamp"] as? Double {
+            timestamp = String(Int(ts))
+        } else {
+            timestamp = ISO8601DateFormatter().string(from: Date())
+        }
+
+        return ChatMessage(
+            id: dict["id"] as? String ?? UUID().uuidString,
+            role: role,
+            content: content,
+            timestamp: timestamp,
+            sessionKey: dict["sessionKey"] as? String ?? dict["session_key"] as? String
+        )
     }
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        return f
+    }()
 }
 
 // MARK: - Gateway Status

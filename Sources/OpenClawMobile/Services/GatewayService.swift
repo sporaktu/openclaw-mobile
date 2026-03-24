@@ -1,53 +1,70 @@
 import Foundation
 
-// MARK: - Gateway Service (WebSocket-based)
-// OpenClaw Gateway uses WebSocket, not REST.
-// Protocol: connect with auth params, then send/receive JSON-RPC style messages.
+// MARK: - Gateway Service (JSON-RPC 3.0 over WebSocket)
 
+@Observable
 @MainActor
-final class GatewayService: ObservableObject {
-    private let config: AppConfiguration
+final class GatewayService {
+    // MARK: - Observable State
+
+    var isConnected = false
+    var isGenerating = false
+    var processingStage: ProcessingStage?
+    var messages: [ChatMessage] = []
+    var streamingText = ""
+    var currentSessionKey = ""
+    var sessions: [Session] = []
+    var agentName = ""
+    var error: String?
+
+    // MARK: - Private
+
     private var webSocket: URLSessionWebSocketTask?
     private var urlSession: URLSession?
+    private var pendingRPCs: [String: CheckedContinuation<[String: Any], any Error>] = [:]
+    private let instanceId = UUID().uuidString
+    private var pingTask: Task<Void, Never>?
+    private var receiveTask: Task<Void, Never>?
+    private var reconnectAttempts = 0
+    private let maxReconnectAttempts = 20
 
-    @Published var messages: [ChatMessage] = []
-    @Published var isConnected: Bool = false
-    @Published var isLoading: Bool = false
-    @Published var error: String?
-    @Published var agentName: String = ""
+    private var gatewayURL = ""
+    private var gatewayToken = ""
 
-    init(config: AppConfiguration) {
-        self.config = config
+    // MARK: - Configuration
+
+    func configure(url: String, token: String) {
+        self.gatewayURL = url
+        self.gatewayToken = token
+    }
+
+    var isConfigured: Bool {
+        !gatewayURL.isEmpty && !gatewayToken.isEmpty
     }
 
     // MARK: - Connection
 
-    func connect() {
-        guard config.isConfigured else {
-            error = "Gateway not configured"
-            return
-        }
-
+    func connect() async throws {
+        guard isConfigured else { throw GatewayError.notConfigured }
         disconnect()
 
-        // Build WebSocket URL with auth params
-        // OpenClaw WS auth: connect.params.auth.token or connect.params.auth.password
-        var urlString = config.gatewayURL
+        var urlString = gatewayURL
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if urlString.hasSuffix("/") { urlString.removeLast() }
+
+        // Convert to WebSocket URL
+        urlString = urlString
             .replacingOccurrences(of: "http://", with: "ws://")
             .replacingOccurrences(of: "https://", with: "wss://")
-
         if !urlString.hasPrefix("ws://") && !urlString.hasPrefix("wss://") {
             urlString = "ws://\(urlString)"
         }
 
-        // Socket.IO style connection — OpenClaw uses socket.io under the hood
-        // The Control UI connects via socket.io with auth in handshake
-        // For a native client, we use the socket.io transport protocol
-        urlString += "/socket.io/?EIO=4&transport=websocket"
+        // The gateway WebSocket endpoint (direct, no socket.io path)
+        urlString += "/ws"
 
         guard let url = URL(string: urlString) else {
-            error = "Invalid gateway URL"
-            return
+            throw GatewayError.invalidURL
         }
 
         let session = URLSession(configuration: .default)
@@ -56,191 +73,448 @@ final class GatewayService: ObservableObject {
         self.webSocket = task
         task.resume()
 
-        // Send auth after connection
-        Task {
-            do {
-                // Socket.IO handshake
-                try await sendRaw("40{\"auth\":{\"token\":\"\(config.gatewayToken)\"}}")
-                isConnected = true
-                config.gatewayConnected = true
-                startReceiving()
-            } catch {
-                isConnected = false
-                config.gatewayConnected = false
-                self.error = "Connection failed: \(error.localizedDescription)"
-            }
-        }
+        // Start receiving messages
+        startReceiveLoop()
+
+        // Wait for connect.challenge event, then respond
+        try await performHandshake()
+
+        isConnected = true
+        reconnectAttempts = 0
+        error = nil
     }
 
     func disconnect() {
+        pingTask?.cancel()
+        pingTask = nil
+        receiveTask?.cancel()
+        receiveTask = nil
         webSocket?.cancel(with: .normalClosure, reason: nil)
         webSocket = nil
         isConnected = false
-        config.gatewayConnected = false
+
+        // Fail all pending RPCs
+        for (_, continuation) in pendingRPCs {
+            continuation.resume(throwing: GatewayError.disconnected)
+        }
+        pendingRPCs.removeAll()
     }
 
-    // MARK: - Send/Receive
+    // MARK: - RPC
 
-    private func sendRaw(_ text: String) async throws {
+    /// Send an RPC request and wait for the response.
+    func rpc(_ method: String, params: [String: Any] = [:]) async throws -> [String: Any] {
         guard let ws = webSocket else { throw GatewayError.notConnected }
-        try await ws.send(.string(text))
-    }
 
-    /// Send a socket.io event: 42["eventName", {payload}]
-    private func sendEvent(_ event: String, payload: [String: Any]) async throws {
-        let payloadData = try JSONSerialization.data(withJSONObject: payload)
-        let payloadStr = String(data: payloadData, encoding: .utf8) ?? "{}"
-        try await sendRaw("42[\"\(event)\",\(payloadStr)]")
-    }
+        let requestId = UUID().uuidString
+        var msg: [String: Any] = [
+            "type": "req",
+            "id": requestId,
+            "method": method
+        ]
+        if !params.isEmpty {
+            msg["params"] = params
+        }
 
-    private func startReceiving() {
-        webSocket?.receive { [weak self] result in
-            Task { @MainActor in
-                switch result {
-                case .success(let message):
-                    switch message {
-                    case .string(let text):
-                        self?.handleMessage(text)
-                    case .data(let data):
-                        if let text = String(data: data, encoding: .utf8) {
-                            self?.handleMessage(text)
-                        }
-                    @unknown default:
-                        break
-                    }
-                    // Continue receiving
-                    self?.startReceiving()
+        let data = try JSONSerialization.data(withJSONObject: msg)
+        let text = String(data: data, encoding: .utf8)!
 
-                case .failure(let error):
-                    self?.isConnected = false
-                    self?.config.gatewayConnected = false
-                    self?.error = "WebSocket error: \(error.localizedDescription)"
+        return try await withCheckedThrowingContinuation { continuation in
+            pendingRPCs[requestId] = continuation
+
+            Task {
+                do {
+                    try await ws.send(.string(text))
+                } catch {
+                    pendingRPCs.removeValue(forKey: requestId)
+                    continuation.resume(throwing: error)
+                }
+            }
+
+            // Timeout after 30 seconds
+            Task {
+                try? await Task.sleep(for: .seconds(30))
+                if let cont = pendingRPCs.removeValue(forKey: requestId) {
+                    cont.resume(throwing: GatewayError.rpcTimeout(method))
                 }
             }
         }
     }
 
-    private func handleMessage(_ text: String) {
-        // Socket.IO protocol:
-        // "0" = connect
-        // "2" = ping, respond with "3"
-        // "3" = pong
-        // "42" = event message
-        if text == "2" {
-            // Ping — respond with pong
-            Task { try? await sendRaw("3") }
+    // MARK: - Chat API
+
+    func sendMessage(_ content: String, sessionKey: String? = nil) async {
+        let key = sessionKey ?? currentSessionKey
+        guard !key.isEmpty else {
+            error = "No session selected"
             return
         }
 
-        if text.hasPrefix("42") {
-            // Parse event: 42["eventName", {...}]
-            let json = String(text.dropFirst(2))
-            parseEvent(json)
-        }
-    }
-
-    private func parseEvent(_ json: String) {
-        guard let data = json.data(using: .utf8),
-              let array = try? JSONSerialization.jsonObject(with: data) as? [Any],
-              let eventName = array.first as? String else { return }
-
-        let payload = array.count > 1 ? array[1] as? [String: Any] : nil
-
-        switch eventName {
-        case "chat":
-            if let payload = payload {
-                handleChatEvent(payload)
-            }
-        case "status":
-            if let name = payload?["agentName"] as? String {
-                agentName = name
-            }
-        default:
-            break
-        }
-    }
-
-    private func handleChatEvent(_ payload: [String: Any]) {
-        guard let role = payload["role"] as? String else { return }
-
-        let content: String
-        if let text = payload["text"] as? String {
-            content = text
-        } else if let contentArray = payload["content"] as? [[String: Any]],
-                  let firstText = contentArray.first?["text"] as? String {
-            content = firstText
-        } else {
-            return
-        }
-
-        let msg = ChatMessage(
-            id: payload["id"] as? String ?? UUID().uuidString,
-            role: role,
-            content: content,
-            timestamp: ISO8601DateFormatter().string(from: Date()),
-            sessionKey: nil
-        )
-        messages.append(msg)
-    }
-
-    // MARK: - Public API
-
-    func sendMessage(_ content: String) async {
-        guard isConnected else {
-            error = "Not connected to gateway"
-            return
-        }
-
-        // Add optimistic user message
-        let userMsg = ChatMessage.userMessage(content)
+        // Optimistic user message
+        let userMsg = ChatMessage.userMessage(content, sessionKey: key)
         messages.append(userMsg)
+        streamingText = ""
+        isGenerating = true
+        processingStage = .thinking
 
         do {
-            try await sendEvent("chat.send", payload: [
+            let idempotencyKey = UUID().uuidString
+            _ = try await rpc("chat.send", params: [
+                "sessionKey": key,
                 "message": content,
-                "sessionKey": config.sessionKey
+                "deliver": false,
+                "idempotencyKey": idempotencyKey
             ])
         } catch {
             self.error = "Failed to send: \(error.localizedDescription)"
+            isGenerating = false
+            processingStage = nil
         }
     }
 
-    func fetchHistory() async {
-        guard isConnected else { return }
+    func fetchHistory(sessionKey: String? = nil, limit: Int = 100) async {
+        let key = sessionKey ?? currentSessionKey
+        guard !key.isEmpty else { return }
+
         do {
-            try await sendEvent("chat.history", payload: [
-                "sessionKey": config.sessionKey,
-                "limit": 50
+            let result = try await rpc("chat.history", params: [
+                "sessionKey": key,
+                "limit": limit
             ])
+
+            if let msgsArray = result["messages"] as? [[String: Any]] {
+                let parsed = msgsArray.compactMap { ChatMessage.from(dict: $0) }
+                messages = parsed
+            }
         } catch {
             self.error = "Failed to fetch history: \(error.localizedDescription)"
         }
     }
 
-    func checkStatus() async {
-        guard isConnected else { return }
+    func abortGeneration(sessionKey: String? = nil) async {
+        let key = sessionKey ?? currentSessionKey
+        guard !key.isEmpty else { return }
+        _ = try? await rpc("chat.abort", params: ["sessionKey": key])
+        isGenerating = false
+        processingStage = nil
+    }
+
+    // MARK: - Session API
+
+    func listSessions() async {
         do {
-            try await sendEvent("status", payload: [:])
+            let result = try await rpc("sessions.list", params: [:])
+            if let sessionsArray = result["sessions"] as? [[String: Any]] {
+                sessions = sessionsArray.compactMap { Session.from(dict: $0) }
+            }
         } catch {
-            self.error = "Failed to get status: \(error.localizedDescription)"
+            self.error = "Failed to list sessions: \(error.localizedDescription)"
+        }
+    }
+
+    func createSession(label: String? = nil, model: String? = nil) async -> String? {
+        var params: [String: Any] = [:]
+        if let label { params["label"] = label }
+        if let model { params["model"] = model }
+
+        do {
+            let result = try await rpc("sessions.create", params: params)
+            let key = result["key"] as? String
+            if let key {
+                await listSessions() // refresh
+            }
+            return key
+        } catch {
+            self.error = "Failed to create session: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    func deleteSession(key: String) async {
+        do {
+            _ = try await rpc("sessions.delete", params: ["key": key])
+            sessions.removeAll { $0.sessionKey == key }
+            if currentSessionKey == key {
+                currentSessionKey = sessions.first?.sessionKey ?? ""
+            }
+        } catch {
+            self.error = "Failed to delete session: \(error.localizedDescription)"
+        }
+    }
+
+    func resetSession(key: String) async {
+        do {
+            _ = try await rpc("sessions.reset", params: ["key": key])
+            if currentSessionKey == key {
+                messages.removeAll()
+            }
+        } catch {
+            self.error = "Failed to reset session: \(error.localizedDescription)"
+        }
+    }
+
+    func patchSession(key: String, label: String? = nil, model: String? = nil, thinking: String? = nil) async {
+        var params: [String: Any] = ["key": key]
+        if let label { params["label"] = label }
+        if let model { params["model"] = model }
+        if let thinking { params["thinking"] = thinking }
+
+        do {
+            _ = try await rpc("sessions.patch", params: params)
+            await listSessions() // refresh
+        } catch {
+            self.error = "Failed to update session: \(error.localizedDescription)"
+        }
+    }
+
+    func switchSession(to key: String) async {
+        currentSessionKey = key
+        messages.removeAll()
+        streamingText = ""
+        isGenerating = false
+        processingStage = nil
+        await fetchHistory(sessionKey: key)
+    }
+
+    // MARK: - Status
+
+    func fetchStatus() async {
+        do {
+            let result = try await rpc("status", params: [:])
+            if let h = result["h"] as? [String: Any],
+               let agent = h["agent"] as? [String: Any],
+               let model = agent["model"] as? String {
+                agentName = model
+            } else if let model = result["model"] as? String {
+                agentName = model
+            }
+        } catch {
+            // Status is non-critical, don't surface error
+        }
+    }
+
+    // MARK: - Private: Handshake
+
+    private func performHandshake() async throws {
+        // Wait for connect.challenge event (handled in receiveLoop)
+        // The challenge comes as an event; we respond with connect RPC
+        // Give it a few seconds to arrive
+        for _ in 0..<50 {
+            try? await Task.sleep(for: .milliseconds(100))
+            if challengeReceived { break }
+        }
+
+        // Send connect request
+        let connectParams: [String: Any] = [
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": [
+                "id": "openclaw-mobile",
+                "version": "1.0.0",
+                "platform": "ios",
+                "mode": "webchat",
+                "instanceId": instanceId
+            ],
+            "role": "operator",
+            "scopes": ["operator.admin", "operator.read", "operator.write", "operator.approvals"],
+            "auth": ["token": gatewayToken],
+            "caps": ["tool-events"]
+        ]
+
+        let result = try await rpc("connect", params: connectParams)
+
+        guard result["ok"] as? Bool == true else {
+            let errMsg = result["error"] as? String ?? "Unknown error"
+            throw GatewayError.authFailed
+        }
+    }
+
+    private var challengeReceived = false
+
+    // MARK: - Private: WebSocket Receive Loop
+
+    private func startReceiveLoop() {
+        receiveTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                guard let ws = await self.webSocket else { break }
+                do {
+                    let message = try await ws.receive()
+                    switch message {
+                    case .string(let text):
+                        await self.handleRawMessage(text)
+                    case .data(let data):
+                        if let text = String(data: data, encoding: .utf8) {
+                            await self.handleRawMessage(text)
+                        }
+                    @unknown default:
+                        break
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.isConnected = false
+                        self.error = "WebSocket error: \(error.localizedDescription)"
+                    }
+                    await self.attemptReconnect()
+                    break
+                }
+            }
+        }
+    }
+
+    private func handleRawMessage(_ text: String) {
+        guard let data = text.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+
+        let type = json["type"] as? String
+
+        switch type {
+        case "res":
+            // RPC response — resolve pending continuation
+            if let id = json["id"] as? String,
+               let continuation = pendingRPCs.removeValue(forKey: id) {
+                continuation.resume(returning: json)
+            }
+
+        case "event":
+            let eventName = json["event"] as? String
+            let payload = json["payload"] as? [String: Any]
+
+            switch eventName {
+            case "connect.challenge":
+                challengeReceived = true
+
+            case "chat":
+                if let payload {
+                    handleChatEvent(payload)
+                }
+
+            case "agent":
+                if let payload {
+                    handleAgentEvent(payload)
+                }
+
+            default:
+                break
+            }
+
+        default:
+            break
+        }
+    }
+
+    // MARK: - Private: Chat Events
+
+    private func handleChatEvent(_ payload: [String: Any]) {
+        guard let event = ChatEventPayload(from: payload) else { return }
+
+        // Only handle events for current session
+        if let key = event.sessionKey, key != currentSessionKey { return }
+
+        switch event.state {
+        case "started":
+            isGenerating = true
+            processingStage = .thinking
+            streamingText = ""
+
+        case "delta":
+            processingStage = .streaming
+            if let delta = event.deltaText {
+                streamingText += delta
+            }
+
+        case "final":
+            isGenerating = false
+            processingStage = nil
+            // Replace streaming text with final messages
+            if let finalMessages = event.messages {
+                // Remove any previous streaming placeholder
+                // Append only assistant messages from final
+                let assistantMessages = finalMessages.filter { $0.isAssistant }
+                for msg in assistantMessages {
+                    // Don't duplicate if already in messages
+                    if !messages.contains(where: { $0.id == msg.id }) {
+                        messages.append(msg)
+                    }
+                }
+            } else if !streamingText.isEmpty {
+                // Fallback: use streamed text as the message
+                let msg = ChatMessage(
+                    id: UUID().uuidString,
+                    role: "assistant",
+                    content: streamingText,
+                    timestamp: ISO8601DateFormatter().string(from: Date()),
+                    sessionKey: currentSessionKey
+                )
+                messages.append(msg)
+            }
+            streamingText = ""
+
+        case "error":
+            isGenerating = false
+            processingStage = nil
+            streamingText = ""
+            let errMsg = event.errorMessage ?? event.error ?? "Unknown error"
+            error = errMsg
+
+        case "aborted":
+            isGenerating = false
+            processingStage = nil
+            if !streamingText.isEmpty {
+                let msg = ChatMessage(
+                    id: UUID().uuidString,
+                    role: "assistant",
+                    content: streamingText + "\n\n[aborted]",
+                    timestamp: ISO8601DateFormatter().string(from: Date()),
+                    sessionKey: currentSessionKey
+                )
+                messages.append(msg)
+            }
+            streamingText = ""
+
+        default:
+            break
+        }
+    }
+
+    // MARK: - Private: Agent Events
+
+    private func handleAgentEvent(_ payload: [String: Any]) {
+        guard let event = AgentEventPayload(from: payload) else { return }
+
+        // Update processing stage based on agent state
+        if let agentState = event.agentState {
+            switch agentState {
+            case "thinking", "processing":
+                processingStage = .thinking
+            case "tool_use":
+                processingStage = .toolUse
+            case "streaming":
+                processingStage = .streaming
+            default:
+                break
+            }
+        }
+    }
+
+    // MARK: - Private: Reconnect
+
+    private func attemptReconnect() async {
+        guard reconnectAttempts < maxReconnectAttempts else {
+            error = "Failed to reconnect after \(maxReconnectAttempts) attempts"
+            return
+        }
+
+        reconnectAttempts += 1
+        let delay = min(30.0, pow(1.5, Double(reconnectAttempts)))
+        try? await Task.sleep(for: .seconds(delay))
+
+        do {
+            try await connect()
+        } catch {
+            // Will retry via receive loop failure
         }
     }
 }
-
-// MARK: - Supporting Types
-
-enum GatewayError: Error, LocalizedError {
-    case notConnected
-    case invalidURL
-    case authFailed
-
-    var errorDescription: String? {
-        switch self {
-        case .notConnected: return "Not connected to gateway"
-        case .invalidURL: return "Invalid gateway URL"
-        case .authFailed: return "Authentication failed"
-        }
-    }
-}
-
-// ChatSession defined in Models/Message.swift

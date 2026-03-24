@@ -2,17 +2,34 @@ import SwiftUI
 
 // MARK: - App Configuration
 
+@Observable
 @MainActor
-final class AppConfiguration: ObservableObject {
+final class AppConfiguration {
+    // Gateway URL stored in UserDefaults (not sensitive)
+    @ObservationIgnored
     @AppStorage("gatewayURL") var gatewayURL: String = ""
-    @AppStorage("gatewayToken") var gatewayToken: String = ""
-    @AppStorage("kgAPIURL") var kgAPIURL: String = ""
-    @AppStorage("kgAPIToken") var kgAPIToken: String = "enigma-kg-local"
-    @AppStorage("sessionKey") var sessionKey: String = "mobile"
 
-    @Published var gatewayConnected: Bool = false
-    @Published var kgConnected: Bool = false
-    @Published var agentName: String = ""
+    // Token stored in Keychain (sensitive)
+    var gatewayToken: String {
+        get { KeychainService.load(key: "gatewayToken") ?? "" }
+        set { try? KeychainService.save(key: "gatewayToken", value: newValue) }
+    }
+
+    // Knowledge Graph
+    @ObservationIgnored
+    @AppStorage("kgAPIURL") var kgAPIURL: String = ""
+
+    @ObservationIgnored
+    @AppStorage("kgAPIToken") var kgAPIToken: String = "enigma-kg-local"
+
+    // Last active session
+    @ObservationIgnored
+    @AppStorage("lastSessionKey") var lastSessionKey: String = "mobile"
+
+    // Connection status (transient)
+    var gatewayConnected = false
+    var kgConnected = false
+    var agentName = ""
 
     var isConfigured: Bool {
         !gatewayURL.isEmpty && !gatewayToken.isEmpty
