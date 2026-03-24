@@ -7,19 +7,31 @@ struct ContentView: View {
 
     var body: some View {
         TabView(selection: $selectedTab) {
-            Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: 0) {
+            Tab("Dashboard", systemImage: "gauge.with.dots.needle.33percent", value: 0) {
+                StatusDashboardView()
+            }
+
+            Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: 1) {
                 ChatContainerView()
             }
 
-            Tab("Sessions", systemImage: "rectangle.stack", value: 1) {
+            Tab("Sessions", systemImage: "rectangle.stack", value: 2) {
                 SessionsListView()
             }
 
-            Tab("Crons", systemImage: "clock.arrow.2.circlepath", value: 2) {
+            Tab("Crons", systemImage: "clock.arrow.2.circlepath", value: 3) {
                 CronsListView()
             }
 
-            Tab("Settings", systemImage: "gear", value: 3) {
+            Tab("Kanban", systemImage: "square.grid.3x3", value: 4) {
+                KanbanBoardView()
+            }
+
+            Tab("Memory", systemImage: "brain", value: 5) {
+                MemoryBrowserView()
+            }
+
+            Tab("Settings", systemImage: "gear", value: 6) {
                 SettingsView()
             }
         }
@@ -28,6 +40,12 @@ struct ContentView: View {
             configureTabBarAppearance()
         }
         .onReceive(NotificationCenter.default.publisher(for: .switchToChat)) { _ in
+            selectedTab = 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .switchToKanban)) { _ in
+            selectedTab = 4
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .switchToDashboard)) { _ in
             selectedTab = 0
         }
     }
@@ -58,4 +76,13 @@ struct ContentView: View {
         .environment(GatewayService())
         .environment(CronService())
         .environment(KnowledgeGraphService())
+        .environment(MemoryService())
+        .environment(KanbanService())
+}
+
+// MARK: - Notification Names
+
+extension Notification.Name {
+    static let switchToKanban = Notification.Name("switchToKanban")
+    static let switchToDashboard = Notification.Name("switchToDashboard")
 }

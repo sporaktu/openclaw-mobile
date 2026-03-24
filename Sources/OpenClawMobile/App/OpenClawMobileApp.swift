@@ -6,6 +6,8 @@ struct OpenClawMobileApp: App {
     @State private var gateway = GatewayService()
     @State private var cronService = CronService()
     @State private var kgService = KnowledgeGraphService()
+    @State private var memoryService = MemoryService()
+    @State private var kanbanService = KanbanService()
 
     var body: some Scene {
         WindowGroup {
@@ -14,6 +16,8 @@ struct OpenClawMobileApp: App {
                 .environment(gateway)
                 .environment(cronService)
                 .environment(kgService)
+                .environment(memoryService)
+                .environment(kanbanService)
                 .preferredColorScheme(.dark)
                 .task {
                     configureServices()
@@ -35,8 +39,12 @@ struct OpenClawMobileApp: App {
     }
 
     private func configureServices() {
-        gateway.configure(url: config.normalizedGatewayURL, token: config.gatewayToken)
-        cronService.configure(url: config.normalizedGatewayURL, token: config.gatewayToken)
+        let url = config.normalizedGatewayURL
+        let token = config.gatewayToken
+        gateway.configure(url: url, token: token)
+        cronService.configure(url: url, token: token)
+        memoryService.configure(url: url, token: token)
+        kanbanService.configure(url: url, token: token)
         kgService.configure(url: config.normalizedKGURL, token: config.kgAPIToken)
     }
 }
